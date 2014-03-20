@@ -1,0 +1,335 @@
+// Copyright 1998-2014 Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	ScreenSpaceReflections.usf: To generate screen space reflections as a postprocess
+=============================================================================*/
+
+#include "Common.usf"	
+#include "PostProcessCommon.usf"				
+#include "DeferredShadingCommon.usf"
+#include "Random.usf"
+#include "BRDF.usf"
+
+// 0:reference (slower, potentially higher quality) 1:use mips of the HZB depth (better performance)
+#define USE_HZB		1
+
+// .r:Intensity in 0..1 range .g:RoughnessMaskMul, b:RoughnessScale, a:unused
+float4 SSRParams;
+
+uint MortonCode( uint x )
+{
+	//x = (x ^ (x <<  8)) & 0x00ff00ff;
+	//x = (x ^ (x <<  4)) & 0x0f0f0f0f;
+	x = (x ^ (x <<  2)) & 0x33333333;
+	x = (x ^ (x <<  1)) & 0x55555555;
+	return x;
+}
+
+uint ReverseUIntBits( uint bits )
+{
+	//bits = ( bits << 16) | ( bits >> 16);
+	//bits = ( (bits & 0x00ff00ff) << 8 ) | ( (bits & 0xff00ff00) >> 8 );
+	//bits = ( (bits & 0x0f0f0f0f) << 4 ) | ( (bits & 0xf0f0f0f0) >> 4 );
+	bits = ( (bits & 0x33333333) << 2 ) | ( (bits & 0xcccccccc) >> 2 );
+	bits = ( (bits & 0x55555555) << 1 ) | ( (bits & 0xaaaaaaaa) >> 1 );
+	return bits;
+}
+
+
+float4 SampleDepthTexture( Texture2D Texture, SamplerState Sampler, float Level, float4 SampleUV0, float4 SampleUV1 )
+{
+	float4 SampleDepth;
+#if USE_HZB
+	SampleDepth.x = Texture2DSampleLevel( Texture, Sampler, SampleUV0.xy, Level ).r;
+	SampleDepth.y = Texture2DSampleLevel( Texture, Sampler, SampleUV0.zw, Level ).r;
+	SampleDepth.z = Texture2DSampleLevel( Texture, Sampler, SampleUV1.xy, Level ).r;
+	SampleDepth.w = Texture2DSampleLevel( Texture, Sampler, SampleUV1.zw, Level ).r;
+#else
+	SampleDepth.x = Texture2DSampleLevel( SceneDepthTexture, SceneDepthTextureSampler, SampleUV0.xy, 0 ).r;
+	SampleDepth.y = Texture2DSampleLevel( SceneDepthTexture, SceneDepthTextureSampler, SampleUV0.zw, 0 ).r;
+	SampleDepth.z = Texture2DSampleLevel( SceneDepthTexture, SceneDepthTextureSampler, SampleUV1.xy, 0 ).r;
+	SampleDepth.w = Texture2DSampleLevel( SceneDepthTexture, SceneDepthTextureSampler, SampleUV1.zw, 0 ).r;
+#endif
+	return SampleDepth;
+}
+
+// @param NumSamples 4/8/12/16/20/.. multiple of 4
+float4 RayCasting(FScreenSpaceData ScreenSpaceData, float Roughness, float RoughnessFade, float SceneDepth, float3 PositionTranslatedWorld, uint FrameRandom, float3 V, float3 N, int2 PixelPos, int NumSamples, bool bGlossy)
+{
+	float4 OutColor = 0;
+
+	float3 R;
+
+	if(bGlossy)
+	{
+		uint2 Random = ScrambleTEA( uint2( PixelPos ) ^ FrameRandom, 3);
+	
+		// todo: we should stratify this
+		float E1 = frac( float( Random.x & 0xffff ) / (1<<16) );
+		float E2 = frac( float( Random.y & 0xffff ) / (1<<16) );
+
+	//	float2 RandOffset = (float2)PixelPos + 32 + float2(15, 7) * View.TemporalAAParams.x;
+	//	E1 = PseudoRandom(RandOffset);
+	//	E2 = PseudoRandom(RandOffset + float2(23, 13));
+
+		// needed to avoid rare sampling outside of the kernel (artifact)
+		E1 += 0.001f;
+		E2 += 0.001f;
+
+		// try to use up if possible  
+		float3 UpVector = abs(N.z) < 0.999 ? float3(0,0,1) : float3(1,0,0);
+
+		float3 TangentX = normalize( cross( UpVector, N ) );
+		float3 TangentY = cross( N, TangentX );
+	
+		float m = Roughness * Roughness;
+		float m2 = m*m;
+
+	#if 1
+		// Blinn
+		float n = 2 / m2 - 2;
+		float Phi = 2 * PI * E1;
+		float CosTheta = pow( E2, 1 / (n + 1) );
+		float SinTheta = sqrt( 1 - CosTheta * CosTheta );
+	#else
+		// GGX
+		float Phi = 2 * PI * E1;
+		float CosTheta = sqrt( (1 - E2) / ( 1 + (m2 - 1) * E2 ) );
+		float SinTheta = sqrt( 1 - CosTheta * CosTheta );
+	#endif
+
+		float3 H = SinTheta * cos( Phi ) * TangentX + SinTheta * sin( Phi ) * TangentY + CosTheta * N;
+
+		R = 2 * dot( V, H ) * H - V;
+	}
+	else
+	{
+		R = reflect( -V, N );
+	}
+	
+	// TODO store in texture
+	uint Morton = MortonCode( PixelPos.x & 3 ) | ( MortonCode( PixelPos.y & 3 ) * 2 );
+	uint ReverseMorton = ReverseUIntBits( Morton );
+	ReverseMorton = ( ReverseMorton + ReverseUIntBits( FrameRandom ) ) & 15;
+	float Offset = ReverseMorton / 15.0;
+
+	// NOTE could clip ray against frustum planes
+
+	// TODO use screen position and skip matrix mul
+	float4 RayStartClip	= mul( float4( PositionTranslatedWorld, 1 ), View.TranslatedWorldToClip );
+	float4 RayEndClip	= mul( float4( PositionTranslatedWorld + R * SceneDepth, 1 ), View.TranslatedWorldToClip );
+
+	float3 RayStartScreen = RayStartClip.xyz / RayStartClip.w;
+	float3 RayEndScreen = RayEndClip.xyz / RayEndClip.w;
+
+	// Normalize 2D length
+	float3 RayStepScreen = ( RayEndScreen - RayStartScreen ) / length( RayEndScreen.xy - RayStartScreen.xy );
+	RayStepScreen *= 1.5;
+
+	// Reduce ray length for rough surfaces
+	//RayStepScreen *= max( 0.25, RoughnessFade );
+
+#if USE_HZB
+	float3 RayStartUVz = float3( RayStartScreen.xy * float2( 0.5, -0.5 ) + 0.5, RayStartScreen.z );
+	float3 RayStepUVz = float3( RayStepScreen.xy * float2( 0.5, -0.5 ), RayStepScreen.z );
+#else
+	float3 RayStartUVz = float3( RayStartScreen.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz, RayStartScreen.z );
+	float3 RayStepUVz = float3( RayStepScreen.xy * View.ScreenPositionScaleBias.xy, RayStepScreen.z );
+#endif
+
+	// *2 to get less morie pattern in extreme cases, larger values make object appear not grounded in reflections
+	const float CompareTolerance = abs( RayStepScreen.z ) / (NumSamples+1) * 2;
+
+	float MinHitTime = 1;
+	float LastDiff = 0;
+
+	UNROLL
+	for( int i = 0; i < NumSamples; i += 4 )
+	{
+		const float4 SampleTime = ( i + Offset + float4( 1, 2, 3, 4 ) ) / (NumSamples + 1);
+
+		// Vectorized to group fetches
+		float4 SampleUV0 = RayStartUVz.xyxy + RayStepUVz.xyxy * SampleTime.xxyy;
+		float4 SampleUV1 = RayStartUVz.xyxy + RayStepUVz.xyxy * SampleTime.zzww;
+		float4 SampleZ   = RayStartUVz.zzzz + RayStepUVz.zzzz * SampleTime;
+		
+		// Use lower res for farther samples
+		float Level = 16.0 * ( (float)i / NumSamples ) * Roughness;
+		float4 SampleDepth = SampleDepthTexture( PostprocessInput1, PostprocessInput1Sampler, Level, SampleUV0, SampleUV1 );
+
+#if 0
+		// Line segment intersection
+		float4 DepthDiff1 = SampleZ - SampleDepth;
+		float4 DepthDiff0 = float4( LastDiff, DepthDiff1.xyz );
+		float4 TimeLerp = saturate( DepthDiff0 / (DepthDiff0 - DepthDiff1) );
+		float4 IntersectTime = SampleTime + (TimeLerp - 1) / (NumSamples + 1);
+	
+		// If hit set to intersect time. If missed set to 1, beyond end of ray
+		float4 HitTime = abs( -DepthDiff1 - CompareTolerance ) < CompareTolerance ? IntersectTime : 1;
+
+		// Take closest hit
+		HitTime.xy = min( HitTime.xy, HitTime.zw );
+		MinHitTime = min( MinHitTime, min( HitTime.x, HitTime.y ) );
+#else
+		float4 DepthDiff1 = SampleZ - SampleDepth;
+		bool4 Hit = abs( -DepthDiff1 - CompareTolerance ) < CompareTolerance;
+
+		BRANCH if( any( Hit ) )
+		{
+			// Line segment intersection
+			float4 DepthDiff0 = float4( LastDiff, DepthDiff1.xyz );
+			float4 TimeLerp = saturate( DepthDiff0 / (DepthDiff0 - DepthDiff1) );
+			float4 IntersectTime = SampleTime + (TimeLerp - 1) / (NumSamples + 1);
+			float4 HitTime = Hit ? IntersectTime : 1;
+
+			// Take closest hit
+			HitTime.xy = min( HitTime.xy, HitTime.zw );
+			MinHitTime = min( HitTime.x, HitTime.y );
+			break;
+		}
+#endif
+
+		LastDiff = DepthDiff1.w;
+	}
+
+	// if there was a hit
+	BRANCH if( MinHitTime != 1 )
+	{
+		float3 HitUVz = RayStartUVz + RayStepUVz * MinHitTime;
+
+	#if USE_HZB
+		HitUVz.xy = ( HitUVz.xy - 0.5 ) / float2( 0.5, -0.5 );
+		HitUVz.xy = HitUVz.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+	#endif
+
+	#if PREV_FRAME_COLOR
+		// Find previous screen position for hit since color buffer is from last frame
+		// TODO combine to single matrix
+		float4 HitClip = float4( (HitUVz.xy - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy, HitUVz.z, 1 );
+		float4 HitTranslatedWorld = mul( HitClip, View.ClipToTranslatedWorld );
+		HitTranslatedWorld /= HitTranslatedWorld.w;
+		
+		float3 PrevTranslatedWorld = HitTranslatedWorld.xyz + (View.PrevPreViewTranslation - View.PreViewTranslation);
+		float4 PrevClip = mul( float4( PrevTranslatedWorld, 1 ), View.PrevTranslatedWorldToClip );
+		float2 PrevScreen = PrevClip.xy / PrevClip.w;
+		float2 PrevUV = PrevScreen.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+
+		OutColor.rgb = Texture2DSampleLevel( PostprocessInput0, PostprocessInput0Sampler, PrevUV, 0 ).rgb;
+		OutColor.a = 1;
+
+		// Off screen masking		
+		float2 Vignette = saturate( abs( PrevScreen ) * 5 - 4 );
+
+		//PrevScreen sometimes has Nans or Infs.  DX11 is protected because saturate turns Nans -> 0.
+		//Do a SafeSaturate so other platforms get the same protection.
+		OutColor *= SafeSaturate( 1.0 - dot( Vignette, Vignette ) );
+	#else
+		OutColor.rgb = Texture2DSampleLevel( PostprocessInput0, PostprocessInput0Sampler, HitUVz.xy, 0 ).rgb;
+		OutColor.a = 1;
+
+		// Off screen masking
+		float2 HitScreenPos = ( HitUVz.xy - View.ScreenPositionScaleBias.wz ) / View.ScreenPositionScaleBias.xy;
+		float2 Vignette = saturate( abs( HitScreenPos) * 5 - 4 );
+		OutColor *= saturate( 1.0 - dot( Vignette, Vignette ) );
+	#endif
+
+		// Transform NaNs to black, transform negative colors to black.
+		OutColor.rgb = -min(-OutColor.rgb, 0.0);
+
+		// Fade end of trace
+		OutColor *= saturate( 4 - 4 * MinHitTime );
+
+		OutColor *= RoughnessFade;
+
+		OutColor *= SSRParams.r;
+	}
+
+	return OutColor;
+}
+
+
+
+void ScreenSpaceReflectionsPS(in float4 UVAndScreenPos : TEXCOORD0, out float4 OutColor : SV_Target0)
+{
+	float2 UV = UVAndScreenPos.xy;
+	float2 ScreenPos = UVAndScreenPos.zw;
+	int2 PixelPos = int2(UVAndScreenPos.zw * ScreenPosToPixel.xy + ScreenPosToPixel.zw + 0.5f);
+
+	OutColor = 0;
+
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(UV);
+
+	float RoughnessMaskAdd = 1;
+
+	// mask SSR to reduce noise and for better performance, roughness of 0 should have SSR, at MaxRoughness we fade to 0
+	float RoughnessFade = saturate(ScreenSpaceData.GBuffer.Roughness * SSRParams.g + 1);
+
+#if 1
+	// Early out
+	BRANCH if( RoughnessFade == 0 || ScreenSpaceData.GBuffer.LightingModelId == 0 )
+	{
+		return;
+	}
+#endif
+
+	float Roughness = ScreenSpaceData.GBuffer.Roughness * SSRParams.b;
+
+	float3 N = ScreenSpaceData.GBuffer.WorldNormal;
+	float SceneDepth = CalcSceneDepth(UV);
+
+	float3 PositionTranslatedWorld = mul( float3( ScreenPos * SceneDepth, SceneDepth ), (float3x3)View.ScreenToTranslatedWorld );
+
+	float3 V = View.TranslatedViewOrigin.xyz - PositionTranslatedWorld;
+	V = normalize( V );
+
+	uint FrameRandom;
+	{
+		bool bTemporalAAIsOn = View.TemporalAAParams.g > 1;
+
+		if(bTemporalAAIsOn)
+		{
+			// usually this number is in the 0..7 range but it depends on the TemporalAA quality
+			FrameRandom = (uint)(View.TemporalAAParams.r * 1551);
+		}
+		else
+		{
+			// todo: using the FrameNumber can be wrong in editor
+			// 4 aligns with the temporal smoothing, larger number will do more flickering (power of two for best performance)
+			const uint RandomizeOverNFrames = 4;
+			FrameRandom = (View.FrameNumber % RandomizeOverNFrames) * 1551;
+		}
+	}
+
+#if SSR_QUALITY == 1
+	const int NumSamplesPerRay = 8;
+	const int NumRays = 1;
+	const bool bGlossy = false;
+#elif SSR_QUALITY == 2
+	const int NumSamplesPerRay = 16;
+	const int NumRays = 1;
+	const bool bGlossy = true;
+#elif SSR_QUALITY == 3
+	const int NumSamplesPerRay = 12;
+	const int NumRays = 8;
+	const bool bGlossy = true;
+#else // SSR_QUALITY == 4
+	const int NumSamplesPerRay = 16;
+	const int NumRays = 16;
+	const bool bGlossy = true;
+#endif
+
+	if(NumRays > 0)
+	{
+		// average multiple ray casting steps
+		LOOP for(int i = 0; i < NumRays; ++i)
+		{
+			OutColor += RayCasting(ScreenSpaceData, Roughness, RoughnessFade, SceneDepth, PositionTranslatedWorld, FrameRandom + i * 117, V, N, PixelPos, NumSamplesPerRay, bGlossy);
+		}
+
+		OutColor /= NumRays;
+	}
+	else
+	{
+		OutColor = RayCasting(ScreenSpaceData, Roughness, RoughnessFade, SceneDepth, PositionTranslatedWorld, FrameRandom, V, N, PixelPos, NumSamplesPerRay, bGlossy);
+	}
+}
